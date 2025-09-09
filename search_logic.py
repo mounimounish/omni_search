@@ -7,7 +7,7 @@ from typing import List, Dict, Any, Tuple
 from ddgs import DDGS
 from bs4 import BeautifulSoup
 
-# Define API endpoint for Wikipedia fallback
+# Define API endpoints for various services
 WIKI_API = "https://en.wikipedia.org/w/api.php"
 
 def summarize_text(text: str) -> str:
@@ -53,9 +53,7 @@ async def browser_search(query: str) -> Tuple[List[Dict], str]:
         
         urls_to_fetch = [r['href'] for r in search_results]
         
-        # Take the top 3 most relevant URLs from the search
         if not urls_to_fetch:
-            # If DDGS returns no results, fall back to Wikipedia
             return await wikipedia_fallback_search(query)
             
         urls_to_fetch = urls_to_fetch[:3]
@@ -78,10 +76,13 @@ async def wikipedia_fallback_search(query: str) -> Tuple[List[Dict], str]:
     """Fallback method using Wikipedia API."""
     print(f"Web search failed. Falling back to Wikipedia API for: '{query}'", file=sys.stderr)
     
+    headers = {'User-Agent': 'Omni-Search-Microservice/1.0 (contact@example.com)'}
+    
     search_params = {"action": "query", "format": "json", "list": "search", "srsearch": query, "srlimit": 1}
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(WIKI_API, params=search_params) as response:
+            async with session.get(WIKI_API, params=search_params, headers=headers) as response:
+                response.raise_for_status() # This will raise an HTTPError for a 403 status
                 search_data = await response.json()
                 search_results = search_data.get("query", {}).get("search", [])
                 if not search_results:
@@ -90,7 +91,8 @@ async def wikipedia_fallback_search(query: str) -> Tuple[List[Dict], str]:
                 page_title = search_results[0]['title']
                 fetch_params = {"action": "query", "format": "json", "prop": "extracts", "explaintext": True, "titles": page_title}
                 
-                async with session.get(WIKI_API, params=fetch_params) as response:
+                async with session.get(WIKI_API, params=fetch_params, headers=headers) as response:
+                    response.raise_for_status()
                     fetch_data = await response.json()
                     pages = fetch_data.get("query", {}).get("pages", {})
                     page = next(iter(pages.values()), None)
@@ -99,7 +101,7 @@ async def wikipedia_fallback_search(query: str) -> Tuple[List[Dict], str]:
                         content = page.get("extract", "")
                         return [{"url": f"https://en.wikipedia.org/wiki/{page_title.replace(' ', '_')}", "content": content}], query
                     return [], query
-    except Exception as e:
+    except aiohttp.ClientError as e:
         print(f"Wikipedia fallback error: {e}", file=sys.stderr)
         return [], query
 
