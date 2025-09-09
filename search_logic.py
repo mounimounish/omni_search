@@ -3,189 +3,125 @@ import json
 import re
 import sys
 import aiohttp
+from typing import List, Dict, Any, Tuple
+from ddgs import DDGS
+from bs4 import BeautifulSoup
 
-# The user will need to install these libraries:
-# pip install ddgs aiohttp
-try:
-    from ddgs import DDGS
-except ImportError:
-    print("Error: The 'ddgs' library is required. Please install it by running: pip install ddgs", file=sys.stderr)
-    sys.exit(1)
+# Define API endpoint for Wikipedia fallback
+WIKI_API = "https://en.wikipedia.org/w/api.php"
 
-def get_precise_answer_from_text(text: str, url: str) -> str | None:
-    """Uses regex to find the incumbent Prime Minister from Wikipedia text."""
-    match = re.search(r"Incumbent\s+([A-Z][\w\.\-]*(?:\s+[A-Z][\w\.\-]*)*)\s+since", text.replace("\n", ""))
-    if match:
-        name = re.sub(r'([a-z])([A-Z])', r'\1 \2', match.group(1))
-        return name
-
-    if "en.wikipedia.org/wiki/" in url:
-        title = url.split("/wiki/")[-1].replace("_", " ")
-        if len(title.split()) > 1 and len(title.split()) < 4:
-            return title
-
-    return None
+def summarize_text(text: str) -> str:
+    """Provides a concise summary of the text."""
+    sentences = re.split(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?)\s', text)
+    num_sentences = 5 if len(sentences) > 5 else len(sentences)
+    summary_sentences = sentences[:num_sentences]
+    summary = " ".join(summary_sentences)
+    if len(sentences) > num_sentences:
+        summary += "..."
+    return summary
 
 def strip_html_tags(html_content: str) -> str:
-    """A basic function to remove HTML tags and clean up whitespace."""
-    html_content = re.sub(r'(?is)<(script|style).*?>.*?(</\1>)', '', html_content)
-    text = re.sub(r'<.*?>', '', html_content)
-    return ' '.join(text.split())
+    """Removes HTML tags and cleans up whitespace."""
+    soup = BeautifulSoup(html_content, 'html.parser')
+    text = soup.get_text(separator=' ', strip=True)
+    return text
 
-async def fetch_url(session, url, query, precise_answer_found):
+async def fetch_and_summarize_url(session: aiohttp.ClientSession, url: str) -> Dict[str, str] | None:
+    """Fetches, cleans, and summarizes content from a single URL."""
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'}
     try:
         async with session.get(url, headers=headers, timeout=10) as response:
             response.raise_for_status()
             text = await response.text()
-            
-            precise_answer = None
-            if ("pm of india" in query.lower() or "prime minister of india" in query.lower()) and not precise_answer_found.is_set():
-                precise_answer = get_precise_answer_from_text(text, url)
-                if precise_answer:
-                    precise_answer_found.set()
-
             text_content = strip_html_tags(text)
-            return {"url": url, "content": text_content}, precise_answer
+            summary = summarize_text(text_content)
+            return {"url": url, "content": summary}
     except aiohttp.ClientError as e:
         print(f"Warning: Could not fetch {url}. Reason: {e}", file=sys.stderr)
-        return None, None
+        return None
 
-async def browser_search(query: str, num_results: int = 3) -> tuple[str | None, list[dict]]:
+async def browser_search(query: str) -> Tuple[List[Dict], str]:
     """
-    Performs a web search asynchronously. If a precise answer is found, it's returned.
-    Otherwise, returns a list of sources for summarization.
+    Performs a general web search with a fallback to a Wikipedia API search.
     """
-    print(f"Performing web search for: '{query}'", file=sys.stderr)
+    print(f"Performing general web search for: '{query}'", file=sys.stderr)
     sources = []
-    precise_answer = None
     
     try:
         with DDGS() as ddgs:
-            search_results = list(ddgs.text(query, max_results=num_results))
+            search_results = list(ddgs.text(query, max_results=5))
         
-        if not search_results:
-            return None, []
-
         urls_to_fetch = [r['href'] for r in search_results]
-        print(f"Fetching content from: {', '.join(urls_to_fetch)}", file=sys.stderr)
-
+        
+        # Take the top 3 most relevant URLs from the search
+        if not urls_to_fetch:
+            # If DDGS returns no results, fall back to Wikipedia
+            return await wikipedia_fallback_search(query)
+            
+        urls_to_fetch = urls_to_fetch[:3]
+        
         async with aiohttp.ClientSession() as session:
-            precise_answer_found = asyncio.Event()
-            tasks = [fetch_url(session, url, query, precise_answer_found) for url in urls_to_fetch]
+            print(f"Fetching content from: {', '.join(urls_to_fetch)}", file=sys.stderr)
+            tasks = [fetch_and_summarize_url(session, url) for url in urls_to_fetch]
             results = await asyncio.gather(*tasks)
 
-            for result, pa in results:
+            for result in results:
                 if result:
                     sources.append(result)
-                if pa and not precise_answer:
-                    precise_answer = pa
-
     except Exception as e:
-        print(f"Error: An unexpected error occurred during web search: {e}", file=sys.stderr)
+        print(f"Error during web search: {e}. Falling back...", file=sys.stderr)
+        return await wikipedia_fallback_search(query)
     
-    return precise_answer, sources
+    return sources, query
 
-def generate_html_output(data: dict) -> str:
-    """Generates a clean HTML document from the result data."""
-    query = data.get('query', 'N/A')
-    answer_type = data.get('type', 'N/A')
+async def wikipedia_fallback_search(query: str) -> Tuple[List[Dict], str]:
+    """Fallback method using Wikipedia API."""
+    print(f"Web search failed. Falling back to Wikipedia API for: '{query}'", file=sys.stderr)
+    
+    search_params = {"action": "query", "format": "json", "list": "search", "srsearch": query, "srlimit": 1}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(WIKI_API, params=search_params) as response:
+                search_data = await response.json()
+                search_results = search_data.get("query", {}).get("search", [])
+                if not search_results:
+                    return [], query
+                
+                page_title = search_results[0]['title']
+                fetch_params = {"action": "query", "format": "json", "prop": "extracts", "explaintext": True, "titles": page_title}
+                
+                async with session.get(WIKI_API, params=fetch_params) as response:
+                    fetch_data = await response.json()
+                    pages = fetch_data.get("query", {}).get("pages", {})
+                    page = next(iter(pages.values()), None)
 
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Search Result: {query}</title>
-    <style>
-        body {{ font-family: sans-serif; line-height: 1.6; margin: 2em; background-color: #f8f9fa; color: #212529; }}
-        .container {{ max-width: 800px; margin: auto; background-color: #ffffff; padding: 2em; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
-        h1 {{ color: #343a40; }}
-        h2 {{ color: #495057; border-bottom: 1px solid #dee2e6; padding-bottom: 0.3em; }}
-        .source {{ margin-bottom: 1.5em; }}
-        .source a {{ color: #007bff; text-decoration: none; }}
-        .source a:hover {{ text-decoration: underline; }}
-        .content {{ background-color: #f8f9fa; padding: 1em; border-radius: 5px; white-space: pre-wrap; word-wrap: break-word; }}
-        .factual-answer {{ font-size: 1.5em; font-weight: bold; color: #28a745; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Search Query</h1>
-        <p><em>{query}</em></p>
-        <h2>Result</h2>
-    """
+                    if page and "missing" not in page:
+                        content = page.get("extract", "")
+                        return [{"url": f"https://en.wikipedia.org/wiki/{page_title.replace(' ', '_')}", "content": content}], query
+                    return [], query
+    except Exception as e:
+        print(f"Wikipedia fallback error: {e}", file=sys.stderr)
+        return [], query
 
-    if answer_type == 'fact':
-        html += f'<div class="factual-answer">{data.get("answer", "No answer found.")}</div>'
-    elif answer_type == 'summary':
-        for source in data.get('sources', []):
-            content_preview = source.get('content', '')[:800]
-            if len(source.get('content', '')) > 800:
-                content_preview += "..."
-            html += f"""
-            <div class="source">
-                <strong>Source:</strong> <a href="{source.get('url')}" target="_blank">{source.get('url')}</a>
-                <div class="content">{content_preview}</div>
-            </div>
-            """
-    else:
-        html += "<p>No results found.</p>"
-
-    html += """
-    </div>
-</body>
-</html>"""
-    return html
-
-
-async def main():
-    """Main function to run the search model."""
+async def main_cli():
+    """Main function for the command-line interface."""
     args = sys.argv[1:]
-    if not args or (len(args) == 1 and args[0] in ["--format", "html"]):
-        print("Usage: python model.py [--format html] \"<query>\"", file=sys.stderr)
+    if not args:
+        print("Usage: python search_logic.py \"query1\" \"query2\" ...", file=sys.stderr)
         sys.exit(1)
-
-    output_format = 'json'
-    query_list = []
-    # Corrected argument parsing
-    is_format_flag = False
-    for arg in args:
-        if is_format_flag:
-            if arg.lower() == 'html':
-                output_format = 'html'
-            is_format_flag = False
-            continue
-        if arg.lower() == '--format':
-            is_format_flag = True
-        else:
-            query_list.append(arg)
     
-    query = " ".join(query_list)
-    result_data = {}
+    tasks = [browser_search(query) for query in args]
+    results = await asyncio.gather(*tasks)
 
-    # Perform the search, which may return a precise answer directly
-    precise_answer, sources = await browser_search(query)
-
-    if precise_answer:
-        result_data = {
-            "type": "fact",
-            "query": query,
-            "answer": precise_answer
-        }
-    elif sources:
-        result_data = {
-            "type": "summary",
-            "query": query,
-            "sources": sources
-        }
-    else:
-        result_data = {"error": "Could not find a relevant answer for that query."}
-
-    if output_format == 'html':
-        print(generate_html_output(result_data))
-    else:
-        print(json.dumps(result_data, indent=2))
+    formatted_results = []
+    for sources, query in results:
+        if sources:
+            result_data = {"type": "summary", "query": query, "sources": sources}
+        else:
+            result_data = {"error": "Could not find a relevant answer for that query."}
+        formatted_results.append(result_data)
+        
+    print(json.dumps(formatted_results, indent=2))
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main_cli())
